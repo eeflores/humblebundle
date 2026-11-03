@@ -63,8 +63,18 @@ class HttpBot:
             return self._opener.open(url)
 
     def download(self, url, path=None, md5sum=None, expected_size=0,
-                 progress=True, keep_partial=False, chunk_size=0):
-        show = progress and progressbar
+                 progress=True, keep_partial=False, chunk_size=0,
+                 callback=None, cancel=None):
+        """ Download url to path and return the saved path, or None if the
+            download was aborted or its MD5 does not match md5sum.
+
+            callback, if given, is called as callback(done, total) after each
+            chunk, where total is 0 if the size is unknown. It replaces the
+            console progress bar.
+            cancel, if given, is a threading.Event. Setting it aborts the
+            download as Ctrl+C would.
+        """
+        show = progress and progressbar and not callback
         chunk_size = chunk_size or 32*1024  # 32K is arbitrary
 
         download = self.get(url)
@@ -110,14 +120,22 @@ class HttpBot:
         # TODO: Perhaps overkill, but network read and md5/sha1/disk write could be done async
         # Could save around 30s for a 1-GiB file
         completed = False
+        done = 0
+        if callback:
+            callback(done, size)
         try:
             with open(path, 'wb') as f:
                 for data in iter(lambda: download.read(chunk_size), b''):
+                    if cancel is not None and cancel.is_set():
+                        break
                     f.write(data)
+                    done += len(data)
                     if show:
-                        done = pbar.value + len(data)
                         pbar.update(min(size, done) if size else done)
-                completed = True
+                    if callback:
+                        callback(done, size)
+                else:
+                    completed = True
         except KeyboardInterrupt:
             pass
         finally:

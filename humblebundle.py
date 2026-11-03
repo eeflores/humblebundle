@@ -73,6 +73,24 @@ class HumbleBundleError(Exception):
     pass
 
 
+class NoDownloadError(HumbleBundleError):
+    '''No download matches the requested criteria'''
+    def __init__(self, message, criteria=None):
+        super().__init__(message)
+        self.criteria = criteria or {}
+
+
+class AmbiguousDownloadError(HumbleBundleError):
+    '''More than one download matches the requested criteria.
+    candidates holds the matching download dicts, so callers can pick one
+    and pass it to download(selected=...).
+    '''
+    def __init__(self, message, candidates, criteria=None):
+        super().__init__(message)
+        self.candidates = candidates
+        self.criteria = criteria or {}
+
+
 def auth_expiry(auth):
     '''Return the expiry timestamp for a _simpleauth_sess cookie value.
 
@@ -111,11 +129,16 @@ class HumbleBundle(httpbot.HttpBot):
 
     def __init__(self, auth=None,
                  datadir=None, configdir=None, cachedir=None, cookiejar=None,
-                 connections=DEFAULT_CONNECTIONS, debug=False):
+                 connections=DEFAULT_CONNECTIONS, debug=False,
+                 autoupdate=True):
         '''auth is the _simpleauth_sess cookie value.
         If omitted, it is read from the keyring.
         connections is the maximum number of simultaneous requests
         made by update().
+        autoupdate controls what happens when there is no cached data:
+        if True, fetch it from the server now with update(); if False,
+        start with no games and bundles and leave fetching to the caller.
+        Check has_data() to see if the cache was loaded.
         '''
         if connections < 1:
             raise HumbleBundleError("connections must be at least 1")
@@ -175,7 +198,16 @@ class HumbleBundle(httpbot.HttpBot):
         # "subproducts" in json. May be not a game, like Soundtracks and eBooks
         self.games   = {}
 
-        # Load bundles and games
+        self.gamedata = osp.join(self.datadir, "gamedata.json")
+
+        if not self.load() and autoupdate:
+            self.update()
+
+
+    def load(self):
+        '''Load bundles and games from the cache files, without network access.
+        Return True if loaded, False if the cache files do not exist.
+        '''
         try:
             with open(osp.join(self.configdir, "bundles.json")) as fp1:
                 with open(osp.join(self.configdir, "games.json")) as fp2:
@@ -184,9 +216,16 @@ class HumbleBundle(httpbot.HttpBot):
                     log.info("Loaded %d games from %d bundles",
                              len(self.games),
                              len(self.bundles))
-            self._merge()
         except IOError:
-            self.update()
+            log.info("No cached data in '%s'", self.configdir)
+            return False
+        self._merge()
+        return True
+
+
+    def has_data(self):
+        '''Return True if there are any games or bundles loaded'''
+        return bool(self.games or self.bundles)
 
 
     def _merge(self):
@@ -201,7 +240,6 @@ class HumbleBundle(httpbot.HttpBot):
             log.warning("Error merging extras: %s", e)
 
         # Merge install instructions
-        self.gamedata = osp.join(self.datadir, "gamedata.json")
         log.debug("Merging games install data from %s", self.gamedata)
         try:
             with open(self.gamedata) as fp:
@@ -212,8 +250,14 @@ class HumbleBundle(httpbot.HttpBot):
             log.warning("Error merging games install data: %s", e)
 
 
-    def update(self):
-        '''Fetch all bundles and games from the server, rebuilding the cache'''
+    def update(self, progress=None, cancel=None):
+        '''Fetch all bundles and games from the server, rebuilding the cache.
+
+        progress, if given, is called as progress(done, total, name) after
+        each order is retrieved, where name is the bundle's human name.
+        cancel, if given, is a threading.Event. Setting it stops the update
+        with HumbleBundleError, leaving the current data untouched.
+        '''
         # Get the keys
         log.info("Retrieving keys from '%s/home/keys'", self.url)
         match = re.search(r'^.*[\'"]?gamekeys[\'"]?\s*[:=]\s*(\[.*\])',
@@ -233,6 +277,11 @@ class HumbleBundle(httpbot.HttpBot):
             futures = [pool.submit(self._load_key, key, True) for key in keys]
             # Collect in the original order of keys
             for i, (key, future) in enumerate(zip(keys, futures), 1):
+                if cancel is not None and cancel.is_set():
+                    pool.shutdown(wait=True, cancel_futures=True)
+                    raise HumbleBundleError(
+                        "Update cancelled at order %d of %d."
+                        " Cached data was not changed." % (i, len(keys)))
                 try:
                     bundle, bundle_games = future.result()
                 except (httpbot.HTTPError, OSError, ValueError) as e:
@@ -244,10 +293,12 @@ class HumbleBundle(httpbot.HttpBot):
                 bundles.update(bundle)
                 games.update(bundle_games)
                 for info in bundle.values():
+                    name = (info.get('human_name') or
+                            info.get('machine_name', '?'))
                     log.info("[%d/%d] %s (%d items)", i, len(keys),
-                             info.get('human_name') or
-                             info.get('machine_name', '?'),
-                             len(bundle_games))
+                             name, len(bundle_games))
+                    if progress:
+                        progress(i, len(keys), name)
 
         self.bundles = bundles
         self.games   = games
@@ -318,14 +369,28 @@ class HumbleBundle(httpbot.HttpBot):
     def download(self, name, path=None, bittorrent=False,
                  dtype=None, arch=None, platform=None, serverfile=None,
                  type_pref=".deb", arch_pref="64",
-                 retry=True):
+                 retry=True, selected=None, progress=None, cancel=None):
+        '''Download a file of game name and return its saved path,
+        or None if the download was aborted or is corrupt.
 
+        The file is chosen by dtype, arch, platform and serverfile, falling
+        back to type_pref and arch_pref. Raise NoDownloadError if none match,
+        and AmbiguousDownloadError (with the candidates) if many do.
+        selected is a download dict, as returned by find_downloads(), to
+        use instead of choosing one. Pass its platform too, as it is needed
+        to find it again if the download URL has expired.
+
+        progress, if given, is called as progress(done, total) while
+        downloading, and replaces the console output and progress bar.
+        cancel, if given, is a threading.Event that aborts the download.
+        '''
         game = self.get_game(name)
-        d = self._choose_download(name=name, dtype=dtype, arch=arch,
-                                  platform=platform, serverfile=serverfile,
-                                  type_pref=type_pref, arch_pref=arch_pref)
-        if not d:
-            return
+        if selected is not None:
+            d = selected
+        else:
+            d = self._choose_download(name=name, dtype=dtype, arch=arch,
+                                      platform=platform, serverfile=serverfile,
+                                      type_pref=type_pref, arch_pref=arch_pref)
 
         # MD5 sum matches direct download files, not .torrent ones.
         if bittorrent:
@@ -333,10 +398,10 @@ class HumbleBundle(httpbot.HttpBot):
         else:
             md5 = d.get('md5', '').lower() or None
 
-        url = d['url'].get('bittorrent' if bittorrent else 'web','')
+        url = d.get('url', {}).get('bittorrent' if bittorrent else 'web','')
         if not url:
-            log.error("Selected download has no URL")
-            return
+            raise NoDownloadError("Selected download for '%s' has no %s URL" %
+                                  (name, 'bittorrent' if bittorrent else 'web'))
 
         # Check if URL has expired
         try:
@@ -354,6 +419,10 @@ class HumbleBundle(httpbot.HttpBot):
                       name, time.ctime(ttl))
             self._load_key(self.bundles.get(game.get('bundle', ''),
                                             {}).get('gamekey', ''))
+            if selected is not None:
+                # The reloaded game has new download dicts, so find the
+                # selected one again by its server file name
+                serverfile = self._download_basename(selected)
             return self.download(name=name,
                                  path=path,
                                  dtype=dtype,
@@ -363,12 +432,20 @@ class HumbleBundle(httpbot.HttpBot):
                                  type_pref=type_pref,
                                  arch_pref=arch_pref,
                                  serverfile=serverfile,
-                                 retry=False)
+                                 retry=False,
+                                 progress=progress,
+                                 cancel=cancel)
 
-        print("Downloading '%s' [%s]\t%s" % (
-            game['human_name'], game['machine_name'], self._download_info(d)))
+        message = "Downloading '%s' [%s]\t%s" % (
+            game['human_name'], game['machine_name'], self._download_info(d))
+        if progress is None:
+            print(message)
+        else:
+            log.info(message)
         try:
-            return super(HumbleBundle, self).download(url, path, md5)
+            return super(HumbleBundle, self).download(url, path, md5,
+                                                      callback=progress,
+                                                      cancel=cancel)
         except httpbot.HTTPError as e:
             # Handle Unauthorized/Not Found (most likely outdated download URL)
             if not e.code in (403, 404):
@@ -387,14 +464,21 @@ class HumbleBundle(httpbot.HttpBot):
                                          self._download_basename(d))
 
 
-    def _choose_download(self, name, dtype=None, arch=None, platform=None,
-                         serverfile=None, type_pref=None, arch_pref=None):
+    def download_info(self, d):
+        '''Return a one-line description of a download dict'''
+        return self._download_info(d).strip()
 
+
+    def find_downloads(self, name, platform=None, dtype=None, arch=None,
+                       serverfile=None):
+        '''Return the list of download dicts of game name for platform that
+        have a URL and match dtype, arch and serverfile, when given.
+        Downloads with no explicit architecture get one guessed from their
+        name, when possible.
+        '''
         game = self.get_game(name)
         candidates = []
-        finalists = []
 
-        # Eliminate the ones that do not match the explicit request
         for plat in game.get('downloads', []):
             if plat.get('platform', '') == platform:
                 for download in plat.get('download_struct', []):
@@ -423,24 +507,34 @@ class HumbleBundle(httpbot.HttpBot):
 
                     candidates.append(download)
 
+        return candidates
+
+
+    def _choose_download(self, name, dtype=None, arch=None, platform=None,
+                         serverfile=None, type_pref=None, arch_pref=None):
+        '''Return the single download dict matching the criteria and
+        preferences. Raise NoDownloadError or AmbiguousDownloadError.
+        '''
+        game = self.get_game(name)
+        criteria = {'dtype':dtype,
+                    'arch':arch,
+                    'serverfile':serverfile,
+                    'platform':platform}
+        candidates = self.find_downloads(name, platform=platform, dtype=dtype,
+                                         arch=arch, serverfile=serverfile)
+        finalists = []
+
         if len(candidates) == 1:
             return candidates[0]
 
         if len(candidates) == 0:
-            log.error("No valid downloads for game '%s' [%s]\n\t criteria %r",
-                      game['human_name'], game['machine_name'],
-                      {'dtype':dtype,
-                       'arch':arch,
-                       'serverfile':serverfile,
-                       'platform':platform})
-            return
+            raise NoDownloadError(
+                "No valid downloads for game '%s' [%s]\n\t criteria %r" %
+                (game['human_name'], game['machine_name'], criteria),
+                criteria)
 
         log.debug("Many download candidates for '%s' [%s]\n\tcriteria %r:\n%s",
-                  game['human_name'], game['machine_name'],
-                  {'dtype':dtype,
-                   'arch':arch,
-                   'serverfile':serverfile,
-                   'platform':platform},
+                  game['human_name'], game['machine_name'], criteria,
                   json.dumps(candidates, indent=2))
 
         # Try type (download name) preference
@@ -482,13 +576,13 @@ class HumbleBundle(httpbot.HttpBot):
                     return finalists[0]
 
         # Give up
-        log.error("Too many download candidates for '%s' [%s]."
-                  " Improve criteria to narrow it down.%s",
-                  game['human_name'], game['machine_name'],
-                  "".join(["\n%s" % self._download_info(x)
-                           for x in finalists or candidates]))
-        #log.debug("\n%s", json.dumps(finalists or candidates, indent=2))
-        return
+        remaining = finalists or candidates
+        raise AmbiguousDownloadError(
+            "Too many download candidates for '%s' [%s]."
+            " Improve criteria to narrow it down.%s" %
+            (game['human_name'], game['machine_name'],
+             "".join(["\n%s" % self._download_info(x) for x in remaining])),
+            remaining, criteria)
 
 
     def install(self, name, method=None):
@@ -679,6 +773,53 @@ class HumbleBundle(httpbot.HttpBot):
             raise HumbleBundleError("Bundle not found: %s" % name)
 
 
+    def list_games(self, regex=None, platform=None):
+        '''Return the sorted machine names of all games, optionally filtered
+        by a regex search on the machine name and by having downloads
+        for platform.
+        '''
+        names = self.games.keys()
+        if regex:
+            names = [k for k in names if re.search(regex, k)]
+        if platform is not None:
+            names = [k for k in names
+                     if any(d.get('platform') == platform
+                            for d in self.games[k].get('downloads', []))]
+        return sorted(names)
+
+
+    def list_bundles(self):
+        '''Return all bundle dicts, sorted by machine name'''
+        return [self.bundles[k] for k in sorted(self.bundles)]
+
+
+    def get_game_bundles(self, name):
+        '''Return the bundle dicts that contain game name'''
+        game = self.get_game(name)
+        machine_name = game.get('machine_name', '')
+        return [bundle for bundle in self.bundles.values()
+                if machine_name in bundle.get('games', [])]
+
+
+    def get_bundle_games(self, name):
+        '''Return the game dicts of bundle name, sorted by machine name'''
+        bundle = self.get_bundle(name)
+        return [self.get_game(game) for game in sorted(bundle['games'])]
+
+
+    def get_downloads(self, name):
+        '''Return the downloads of game name as a list of
+        (platform, [download dicts]) tuples, sorted by platform.
+        Only downloads with a URL are listed, so a list may be empty.
+        A platform may appear more than once.
+        '''
+        game = self.get_game(name)
+        return [(plat.get('platform', ''),
+                 [d for d in plat.get('download_struct', []) if 'url' in d])
+                for plat in sorted(game.get('downloads', []),
+                                   key=lambda k: k['platform'])]
+
+
     def get(self, url, postdata=None):
 
         def urlabspath(url):
@@ -735,15 +876,8 @@ def main(argv=None):
         clear_auth()
 
     if args.list is not None:
-        games = hb.games
-        if isinstance(args.list, str):
-            games = {k: v for k, v in hb.games.items() if re.search(args.list, k)}
-
-        if args.platform is not None:
-            hasPlatform = lambda v, p: any(__ for __ in v['downloads'] if __['platform'] == p)
-            games = {k: v for k, v in games.items() if hasPlatform(v, args.platform)}
-
-        for key in sorted(games.keys()):
+        regex = args.list if isinstance(args.list, str) else None
+        for key in hb.list_games(regex=regex, platform=args.platform):
             print("%s" % (hb.games[key]['human_name'] if args.human else key))
 
     elif args.show:
@@ -761,21 +895,16 @@ def main(argv=None):
         print_key('human_name', 'Developer', obj=game.get('payee',{}))
         print_key('URL')
         print_key('', 'Bundles')
-        for bundle in hb.bundles.values():
-            if game.get('machine_name', '') in bundle.get('games', []):
-                print("\t%s [%s]" % (bundle['human_name'],
-                                     bundle['machine_name']))
+        for bundle in hb.get_game_bundles(args.show):
+            print("\t%s [%s]" % (bundle['human_name'],
+                                 bundle['machine_name']))
         print_key('', 'Downloads')
         platform_prev = None
-        for download in sorted(game.get('downloads', []),
-                               key=lambda k: k['platform']):
-            platform = download.get('platform', '')
+        for platform, downloads in hb.get_downloads(args.show):
             if platform_prev != platform:
                 print("\t%s" % platform)
                 platform_prev = platform
-            for d in download.get('download_struct', []):
-                if 'url' not in d:
-                    continue
+            for d in downloads:
                 print(hb._download_info(d))
 
     elif args.show_bundle:
@@ -793,17 +922,16 @@ def main(argv=None):
         print_key('Category')
         print_key('familyamount', 'Price US$')
         print_key('', 'Games')
-        for name in sorted(bundle['games']):
-            game = hb.get_game(name)
+        for game in hb.get_bundle_games(args.show_bundle):
             print("\t%s\t[%s]" % (game['human_name'], game['machine_name']))
 
     elif args.list_bundles:
-        for bundle in sorted(hb.bundles.items()):
+        for bundle in hb.list_bundles():
             if args.human:
-                print(bundle[1]['human_name'])
+                print(bundle['human_name'])
             else:
-                print("%s\t%s" % (bundle[1]['machine_name'],
-                                  bundle[1]['human_name']))
+                print("%s\t%s" % (bundle['machine_name'],
+                                  bundle['human_name']))
 
     elif args.download:
         if not hb.download(name=args.download,
