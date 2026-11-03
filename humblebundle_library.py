@@ -19,12 +19,15 @@
 
 '''Keep a local folder of files downloaded from Humble Bundle.
 
-Files are stored as <folder>/<bundle>/<game>/<platform>/<file>, so a game
+Files are stored as <folder>/<bundle>/<platform>/<file>, so a game
 downloaded on its own goes to the same place as when its whole bundle is
 downloaded. Games that are not in any bundle use the UNBUNDLED folder.
+A bundle's folder is its machine name, or a shorter alias set in
+config.ini, section [aliases], as <bundle machine name> = <alias>.
 
-A manifest.json in the folder records what was downloaded, so later runs
-can skip files already downloaded and flag files that changed.
+A manifest.json in the folder records what was downloaded, and the game
+each file belongs to, so later runs can skip files already downloaded and
+flag files that changed.
 
 The folder is set once in config.ini, section [downloads], key folder.
 '''
@@ -51,6 +54,8 @@ log = logging.getLogger(__name__)
 
 CONFIG_SECTION = "downloads"
 CONFIG_KEY = "folder"
+# config.ini section of bundle machine name = shorter folder name
+ALIAS_SECTION = "aliases"
 MANIFEST = "manifest.json"
 MANIFEST_VERSION = 1
 
@@ -117,6 +122,88 @@ def set_folder(path, configdir=None):
     return path
 
 
+def get_aliases(configdir=None):
+    '''Return the bundle aliases set in config.ini, as a dict of
+    bundle machine name -> folder name'''
+    config = humblebundle.read_config(configdir)
+    if not config.has_section(ALIAS_SECTION):
+        return {}
+    return {k: v for k, v in config.items(ALIAS_SECTION) if v}
+
+
+def resolve_bundle(hb, name):
+    '''Return the machine name of the bundle named name, which may be a
+    machine name, an alias or UNBUNDLED'''
+    if name == UNBUNDLED or name in hb.bundles:
+        return name
+    for bundle, alias in get_aliases(hb.configdir).items():
+        if alias.lower() == name.lower():
+            return bundle
+    raise LibraryError("Bundle not found: %s" % name)
+
+
+def set_alias(hb, bundle, alias=None):
+    '''Set the folder name of bundle to alias, or remove its alias if alias
+    is None, so it goes back to the bundle's machine name.
+
+    If the bundle already has files in the download folder, its folder is
+    renamed and the manifest updated, so nothing is downloaded again.
+    Return the new folder name.
+    '''
+    bundle = resolve_bundle(hb, bundle)
+    if bundle == UNBUNDLED:
+        raise LibraryError("%s cannot have an alias" % UNBUNDLED)
+    aliases = get_aliases(hb.configdir)
+    old = aliases.get(bundle) or safe_name(bundle)
+    new = alias or safe_name(bundle)
+
+    if alias is not None:
+        if safe_name(alias) != alias or alias in ('.', '..'):
+            raise LibraryError("Invalid alias '%s': use a name that is valid"
+                               " as a folder on Windows, macOS and Linux"
+                               % alias)
+        # Folder names must stay unique, ignoring case as macOS and
+        # Windows do
+        taken = {UNBUNDLED.lower(): UNBUNDLED}
+        for other in hb.bundles:
+            if other != bundle:
+                name = aliases.get(other) or safe_name(other)
+                taken[name.lower()] = other
+                taken[other.lower()] = other
+        if alias.lower() in taken:
+            raise LibraryError("Alias '%s' is already used by %s" %
+                               (alias, taken[alias.lower()]))
+
+    folder = get_folder(hb.configdir)
+    if folder and old != new:
+        lib = Library(hb, folder)
+        lib.check_folder()
+        src, dst = osp.join(lib.folder, old), osp.join(lib.folder, new)
+        moved = {k: v for k, v in lib.files.items()
+                 if k.split('/', 1)[0] == old}
+        if osp.exists(src):
+            # samefile: a change of case only, on a case-insensitive disk
+            if osp.exists(dst) and not osp.samefile(src, dst):
+                raise LibraryError("Folder already exists: %s" % dst)
+            log.info("Renaming %s to %s", src, dst)
+            os.rename(src, dst)
+        if moved:
+            for key, entry in moved.items():
+                del lib.files[key]
+                lib.files[new + key[len(old):]] = entry
+            lib._save_manifest()
+
+    config = humblebundle.read_config(hb.configdir)
+    if not config.has_section(ALIAS_SECTION):
+        config.add_section(ALIAS_SECTION)
+    if alias is None:
+        config.remove_option(ALIAS_SECTION, bundle)
+    else:
+        config.set(ALIAS_SECTION, bundle, alias)
+    humblebundle.write_config(config, hb.configdir)
+    return new
+
+
 # Download plan ---------------------------------------------------------------
 
 @dataclass
@@ -170,8 +257,14 @@ class Library:
                                " hb --download-folder PATH")
         self.folder = osp.abspath(osp.expanduser(folder))
         self.manifest_path = osp.join(self.folder, MANIFEST)
+        self.aliases = get_aliases(hb.configdir)
         self._lock = threading.Lock()
         self._files = None  # loaded on first use
+
+    def bundle_folder(self, bundle):
+        '''Return the folder name of bundle: its alias, if set, or its
+        machine name'''
+        return self.aliases.get(bundle) or safe_name(bundle)
 
     def check_folder(self):
         '''Raise LibraryError if the folder is not there, such as when it is
@@ -268,13 +361,13 @@ class Library:
         if not basename:
             return None
         md5 = download.get('md5', '').lower()
-        parts = [safe_name(bundle), safe_name(game), safe_name(platform),
+        parts = [self.bundle_folder(bundle), safe_name(platform),
                  safe_name(basename)]
         relpath = "/".join(parts)
         key = relpath.lower()  # macOS and Windows ignore case
         if key in seen:
             if seen[key] == md5:
-                return None  # the same file listed twice
+                return None  # the same file, listed twice or by two games
             # A different file with the same name: keep both
             stem, ext = osp.splitext(parts[-1])
             parts[-1] = "%s-%s%s" % (stem, md5[:8] or "dup", ext)

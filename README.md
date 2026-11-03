@@ -264,13 +264,23 @@ Keep a local copy of your bundles in one folder. Set it once; it is saved in
 	$ hb --download-folder /Volumes/Archive/HumbleBundle
 
 Download every file of a bundle, or only some of its games, optionally for one
-platform. Files go to `BUNDLE/GAME/PLATFORM/FILE` in the folder, so a game
+platform. Files go to `BUNDLE/PLATFORM/FILE` in the folder, so a game
 downloaded on its own lands where it would as part of its bundle. Use
 `_unbundled` for games that are not in any bundle:
 
 	$ hb --sync hib5
 	$ hb --sync hib5 braid --platform mac
 	$ hb --sync hib5 --dry-run
+
+Some bundle machine names are long, which can matter for Windows path limits.
+Give a bundle a shorter folder name with an alias, saved in `config.ini`.
+Files already downloaded are moved to the new folder, and the alias can be
+used in place of the bundle name:
+
+	$ hb --alias cprogrammingmasterclasscodefasterbuildsmartermasterc_bookbundle cpp_masterclass
+	$ hb --sync cpp_masterclass
+	$ hb --alias                    # list aliases
+	$ hb --alias cpp_masterclass    # remove it, going back to the full name
 
 A `manifest.json` in the folder records each downloaded file and its MD5.
 Running `--sync` again skips files you already have and resumes interrupted

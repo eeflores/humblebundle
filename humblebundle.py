@@ -121,7 +121,8 @@ def read_config(configdir=None):
     '''Return the settings in config.ini as a ConfigParser.
     A missing file gives empty settings.
     '''
-    config = configparser.ConfigParser()
+    config = configparser.ConfigParser(interpolation=None)
+    config.optionxform = str  # keep the case of keys, such as bundle names
     path = config_path(configdir)
     try:
         with open(path, encoding='utf-8') as fp:
@@ -927,7 +928,8 @@ def main(argv=None):
         else:
             print("Download folder: %s" %
                   library.set_folder(args.download_folder))
-        if not args.sync and not args.update and not args.auth:
+        if (not args.sync and not args.update and not args.auth and
+                args.alias is None):
             return
 
     auth = prompt_auth() if args.auth else None
@@ -943,9 +945,27 @@ def main(argv=None):
     # Without --platform, --list and --download use linux, --sync uses all
     platform = args.platform or "linux"
 
-    if args.sync:
-        return sync(hb, args.sync[0], args.sync[1:], args.platform,
-                    dry_run=args.dry_run)
+    if args.alias is not None:
+        import humblebundle_library as library
+        if not args.alias:
+            aliases = library.get_aliases(hb.configdir)
+            for bundle in sorted(aliases):
+                print("%s\t%s" % (aliases[bundle], bundle))
+            if not aliases:
+                print("No aliases set")
+        elif len(args.alias) > 2:
+            raise HumbleBundleError("--alias takes a BUNDLE and an optional"
+                                    " NAME")
+        else:
+            bundle = library.resolve_bundle(hb, args.alias[0])
+            folder = library.set_alias(hb, bundle, (args.alias[1:] or
+                                                    [None])[0])
+            print("Bundle %s now uses folder %s" % (bundle, folder))
+
+    elif args.sync:
+        import humblebundle_library as library
+        return sync(hb, library.resolve_bundle(hb, args.sync[0]),
+                    args.sync[1:], args.platform, dry_run=args.dry_run)
 
     elif args.list is not None:
         regex = args.list if isinstance(args.list, str) else None
@@ -1023,7 +1043,7 @@ def main(argv=None):
 
     else:
         if not (args.update or args.clear or
-                args.download_folder is not None):
+                args.download_folder is not None or args.alias is not None):
             parser.print_usage()
 
 
@@ -1166,7 +1186,8 @@ def parseargs(argv=None):
                         metavar=("BUNDLE", "GAME"),
                         help="Download all files of BUNDLE, or only of the"
                             " given GAMEs in it, to the download folder,"
-                            " as BUNDLE/GAME/PLATFORM/FILE. Files already"
+                            " as BUNDLE/PLATFORM/FILE. BUNDLE may be its"
+                            " alias. Files already"
                             " downloaded are skipped, interrupted ones are"
                             " resumed and files changed on the server are"
                             " reported but not replaced. Use _unbundled"
@@ -1179,6 +1200,13 @@ def parseargs(argv=None):
                         help="Set the folder used by --sync, saving it in"
                             " config.ini. The folder must exist. Without"
                             " PATH, show the current folder.")
+    group.add_argument('-K', '--alias', dest='alias', nargs='*',
+                        metavar=("BUNDLE", "NAME"),
+                        help="Use NAME as the folder of BUNDLE in the"
+                            " download folder, instead of its long machine"
+                            " name, saving it in config.ini. Files already"
+                            " downloaded are moved. Without NAME, remove"
+                            " the alias. With no arguments, list aliases.")
     group.add_argument('-N', '--dry-run', dest='dry_run',
                         default=False, action="store_true",
                         help="With --sync, list each file and its status"
