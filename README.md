@@ -13,7 +13,7 @@ It's like `apt-get` for Humble Bundle :)
 Requirements
 ------------
 
-- **Python** (tested in Python 2.7, can easily be ported to Python 3)
+- **Python** 3.8 or newer
 - **Bash** (for the install hooks. Some may require version 4+)
 
 Python and Bash are already installed by default in virtually all GNU/Linux distros.
@@ -23,13 +23,13 @@ Dependencies
 ------------
 
 - [lxml](http://lxml.de)
-- [Progressbar](https://code.google.com/p/python-progressbar)
+- [Progressbar2](https://github.com/wolph/python-progressbar)
 - [Python Keyring Lib](https://github.com/jaraco/keyring)
 - [PyXDG](https://freedesktop.org/wiki/Software/pyxdg/)
 
 The above can be installed in any modern Debian-like distros (like Ubuntu/Mint) with:
 
-	sudo apt-get install python-{lxml,progressbar,keyring,xdg}
+	sudo apt-get install python3-{lxml,progressbar2,keyring,xdg}
 
 
 Install

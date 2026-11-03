@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 #
 # humblebundle - Manager for Humble Bundle games and bundles
 #
@@ -38,22 +37,14 @@ import threading
 import subprocess
 import shlex
 import shutil
+import queue
+import http.cookiejar as cookielib
+from urllib.parse import urljoin, urlsplit, parse_qs
 
-try:
-    import cookielib
-    from urlparse import urljoin, urlsplit, parse_qs
-    import Queue
-except ImportError:  # Python 3
-    import http.cookiejar as cookielib
-    from urllib.parse import urljoin, urlsplit, parse_qs
-    import queue as Queue
-
-# Debian/Ubuntu: python[3]-xdg
 # PyPI: pyxdg
 import xdg.BaseDirectory as xdg
 
 try:
-    # Debian/Ubuntu: python[3]-keyring
     # PyPI: keyring
     import keyring
 except ImportError:
@@ -208,15 +199,15 @@ class HumbleBundle(httpbot.HttpBot):
             raise HumbleBundleError("GameKeys list not found")
 
         # Loop the bundles
-        queue = Queue.Queue()
+        results = queue.Queue()
         keys = json.loads(match.groups()[0])
         for key in keys:
-            t = threading.Thread(target=self._load_key, args=(key, True, queue))
+            t = threading.Thread(target=self._load_key, args=(key, True, results))
             t.daemon = True
             t.start()
 
         for __ in range(len(keys)):
-            bundle, games = queue.get()
+            bundle, games = results.get()
             self.bundles.update(bundle)
             self.games.update(games)
 
@@ -701,9 +692,10 @@ class HumbleBundle(httpbot.HttpBot):
             token = re.search(r"\s+value=['\"]([^'\"]+)['\"]",
                               re.search(r"(<input\s+[^>]*\s+name\s*=\s*"
                                         "['\"]_le_csrf_token['\"][^>]*>)",
-                                        res.read()).groups()[0]).groups()[0]
+                                        res.read().decode('utf-8')
+                                        ).groups()[0]).groups()[0]
         except Exception as e:
-            raise HumbleBundleError("Could not retrieve token: %r", e)
+            raise HumbleBundleError("Could not retrieve token: %r" % e)
 
         try:
             res = super(HumbleBundle, self).get("/processlogin",
@@ -733,7 +725,7 @@ class HumbleBundle(httpbot.HttpBot):
 
 
 def main(argv=None):
-    if argv == None:
+    if argv is None:
         argv = sys.argv[1:]
     args, parser = parseargs(argv)
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), None),
@@ -781,7 +773,7 @@ def main(argv=None):
         print_key('human_name', 'Developer', obj=game.get('payee',{}))
         print_key('URL')
         print_key('', 'Bundles')
-        for bundle in hb.bundles.itervalues():
+        for bundle in hb.bundles.values():
             if game.get('machine_name', '') in bundle.get('games', []):
                 print("\t%s [%s]" % (bundle['human_name'],
                                      bundle['machine_name']))

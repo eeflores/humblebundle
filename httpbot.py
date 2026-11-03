@@ -1,5 +1,4 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 #
 #    Copyright (C) 2012 Rodrigo Silva (MestreLion) <linux@rodrigosilva.com>
 #
@@ -19,45 +18,36 @@
 # urllib2 wrapper for a simpler, higher-level API
 
 import os
-import sys
-import urllib
 import logging
 import hashlib
-
-if sys.version_info.major < 3:
-    import urllib2   # @UnresolvedImport
-    import urlparse  # @UnresolvedImport
-    HTTPError = urllib2.HTTPError
-else:
-    import urllib.request as urllib2
-    import urllib.parse as urlparse
-    urllib.unquote  = urlparse.unquote
-    HTTPError       = urllib.error.HTTPError
+import urllib.request
+import urllib.parse
+from urllib.error import HTTPError
 
 
-from lxml import html   # Debian/Ubuntu: python-lxml
+from lxml import html   # PyPI: lxml
 try:
-    import progressbar  # Debian/Ubuntu: python-progressbar
+    import progressbar  # PyPI: progressbar2
 except ImportError:
     progressbar = None
 
 
 log = logging.getLogger(__name__)
 
-class HttpBot(object):
+class HttpBot:
     """ Base class for other handling basic http tasks like requesting a page,
         download a file and cache content. Not to be used directly
     """
     def __init__(self, base_url="", tag="", cookiejar=None, debug=False):
         self.tag = tag
-        hh  = urllib2.HTTPHandler( debuglevel=1 if debug else 0)
-        hsh = urllib2.HTTPSHandler(debuglevel=1 if debug else 0)
-        cp  = urllib2.HTTPCookieProcessor(cookiejar)
-        self._opener = urllib2.build_opener(hh, hsh, cp)
-        scheme, netloc, path, q, f  = urlparse.urlsplit(base_url, "http")
+        hh  = urllib.request.HTTPHandler( debuglevel=1 if debug else 0)
+        hsh = urllib.request.HTTPSHandler(debuglevel=1 if debug else 0)
+        cp  = urllib.request.HTTPCookieProcessor(cookiejar)
+        self._opener = urllib.request.build_opener(hh, hsh, cp)
+        scheme, netloc, path, q, f  = urllib.parse.urlsplit(base_url, "http")
         if not netloc:
             netloc, _, path = path.partition('/')
-        self.base_url = urlparse.urlunsplit((scheme, netloc, path, q, f))
+        self.base_url = urllib.parse.urlunsplit((scheme, netloc, path, q, f))
 
     def get(self, url, postdata=None):
         """ Send an HTTP request, either GET (if no postdata) or POST
@@ -65,9 +55,10 @@ class HttpBot(object):
             postdata is a dict with name/value pairs
             url can be absolute or relative to base_url
         """
-        url = urlparse.urljoin(self.base_url, url)
+        url = urllib.parse.urljoin(self.base_url, url)
         if postdata:
-            return self._opener.open(url, urllib.urlencode(postdata))
+            data = urllib.parse.urlencode(postdata).encode('ascii')
+            return self._opener.open(url, data)
         else:
             return self._opener.open(url)
 
@@ -84,8 +75,8 @@ class HttpBot(object):
         path = os.path.expanduser(path or ".")
         if os.path.isdir(path) or not os.path.basename(path):
             #TODO: Parse Content-Disposition header for filename
-            basename = urllib.unquote(os.path.basename
-                                     (urlparse.urlsplit(download.geturl()).path))
+            basename = urllib.parse.unquote(os.path.basename(
+                urllib.parse.urlsplit(download.geturl()).path))
             path = os.path.join(path, basename)
         log.info("Downloading to %s", path)
 
@@ -114,7 +105,7 @@ class HttpBot(object):
                 ' ', progressbar.Bar('.'),
                 ' ', progressbar.FileTransferSpeed(),
                 ' ', progressbar.ETA(),
-                ' '], maxval=size).start()
+                ' '], max_value=size or progressbar.UnknownLength).start()
 
         # TODO: Perhaps overkill, but network read and md5/sha1/disk write could be done async
         # Could save around 30s for a 1-GiB file
@@ -124,7 +115,8 @@ class HttpBot(object):
                 for data in iter(lambda: download.read(chunk_size), b''):
                     f.write(data)
                     if show:
-                        pbar.update(min([size, pbar.value + chunk_size]))
+                        done = pbar.value + len(data)
+                        pbar.update(min(size, done) if size else done)
                 completed = True
         except KeyboardInterrupt:
             pass
@@ -150,12 +142,10 @@ class HttpBot(object):
                 log.debug("Expected and downloaded MD5:\n%s\n%s", md5sum, realhash)
 
     def quote(self, text):
-        """ Quote a text for URL usage, similar to urllib.quote_plus.
-            Handles unicode and also encodes "/"
+        """ Quote a text for URL usage, similar to urllib.parse.quote_plus.
+            Also encodes "/"
         """
-        if isinstance(text, unicode):
-            text = text.encode('utf-8')
-        return urllib.quote_plus(text, safe=b'')
+        return urllib.parse.quote_plus(text, safe='')
 
     def parse(self, url, postdata=None):
         """ Parse an URL and return an etree ElementRoot.
