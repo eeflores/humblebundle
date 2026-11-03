@@ -22,9 +22,6 @@
 # - Log to file, with debug or info level
 # - Add --clear-cache, --clear-credentials, --clear-data, and --purge
 
-HB_USERNAME = ""
-HB_PASSWORD = ""
-
 import os
 import os.path as osp
 import sys
@@ -44,12 +41,6 @@ from urllib.parse import urljoin, urlsplit, parse_qs
 # PyPI: pyxdg
 import xdg.BaseDirectory as xdg
 
-try:
-    # PyPI: keyring
-    import keyring
-except ImportError:
-    keyring = None
-
 
 import httpbot
 
@@ -63,7 +54,6 @@ APPNAME   = __name__
 DATADIR   = osp.dirname(osp.realpath(__file__))
 CONFIGDIR = osp.join(xdg.xdg_config_home, APPNAME)
 CACHEDIR  = osp.join(xdg.xdg_cache_home, APPNAME)
-AUTHFILE  = osp.join(CONFIGDIR, "login.auth")
 COOKIEJAR = osp.join(CONFIGDIR, "cookies.txt")
 
 
@@ -76,12 +66,9 @@ class HumbleBundle(httpbot.HttpBot):
     url = "https://www.humblebundle.com"
     auth_urls = ("/login", "/user/humbleguard")
 
-    def __init__(self, username=None, password=None, auth=None, code=None,
+    def __init__(self, auth=None, code=None,
                  datadir=None, configdir=None, cachedir=None, cookiejar=None,
                  debug=False):
-        self.username = username
-        self.password = password
-
         self.datadir   = datadir   or DATADIR
         self.configdir = configdir or CONFIGDIR
         self.cachedir  = cachedir  or CACHEDIR
@@ -679,48 +666,10 @@ class HumbleBundle(httpbot.HttpBot):
                     "Browser verification code required."
                     " Check your email and retry with --code")
 
-        # Login form
-        if not (self.username and self.password):
-            raise HumbleBundleError(
-                "Username or password are blank. "
-                "Set with --username and --password and try again")
-
-        log.info("Authenticating at '%s/processlogin'", self.url)
-
-        try:
-            # Could also get the token from res.headers.get("Set-Cookie")
-            token = re.search(r"\s+value=['\"]([^'\"]+)['\"]",
-                              re.search(r"(<input\s+[^>]*\s+name\s*=\s*"
-                                        "['\"]_le_csrf_token['\"][^>]*>)",
-                                        res.read().decode('utf-8')
-                                        ).groups()[0]).groups()[0]
-        except Exception as e:
-            raise HumbleBundleError("Could not retrieve token: %r" % e)
-
-        try:
-            res = super(HumbleBundle, self).get("/processlogin",
-                                                {'goto'    : url,
-                                                 'username': self.username,
-                                                 'password': self.password,
-                                                 '_le_csrf_token': token})
-            save_cookies(res, force=True)
-
-        except httpbot.HTTPError as e:
-            # 'Bad Request', 'Unauthorized' or 'Forbidden' are expected
-            # in case of wrong passwords
-            if e.code in [400, 401, 403]:
-                raise HumbleBundleError(
-                    "Could not log in. Either username/password are"
-                    " not correct, or a ReCaptcha validation is required."
-                    " Log in using a real browser, inspect the cookies created"
-                    " and provide the value of _simpleauth_sess with --auth")
-            raise
-
-        # Was it already redirected to the page requested?
-        if requested_url == urlabspath(res.geturl()):
-            return res
-
-        return self.get(url, postdata)
+        # Login required: the session cookie is missing or expired
+        raise HumbleBundleError(
+            "Not logged in. Log in using a real browser, inspect the cookies"
+            " created and provide the value of _simpleauth_sess with --auth")
 
 
 
@@ -731,14 +680,7 @@ def main(argv=None):
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), None),
                         format='%(asctime)s\t%(levelname)-8s\t%(message)s')
     log.debug(args)
-    config = read_config(args)
-
-    username = args.username or config['username'] or HB_USERNAME
-    password = args.password or config['password'] or HB_PASSWORD
-
-    hb = HumbleBundle(username, password,
-                      args.auth, args.code,
-                      debug=args.debug)
+    hb = HumbleBundle(auth=args.auth, code=args.code, debug=args.debug)
 
     if args.update:
         hb.update()
@@ -838,94 +780,20 @@ def main(argv=None):
             parser.print_usage()
 
 
-def clear_auth(appname=None, authfile=None, cookiejar=None):
+def clear_auth(cookiejar=None):
     '''Clear all authentication data and delete related files'''
 
-    appname   = appname   or APPNAME
-    authfile  = authfile  or AUTHFILE
     cookiejar = cookiejar or COOKIEJAR
-
-    authfiles = [cookiejar]
 
     log.info("Clearing all authentication data")
 
-    if keyring:
-        try:
-            log.debug("Removing credentials from keyring")
-            keyring.delete_password(appname, appname)
-        except AttributeError as e:
-            log.warning("Error removing keyring credentials. Outdated library? (%s)", e)
-    else:
-        authfiles.append(authfile)
-
-    for auth in authfiles:
-        try:
-            log.debug("Deleting '%s'", auth)
-            os.remove(auth)
-        except OSError as e:
-            log.debug(e)
+    try:
+        log.debug("Deleting '%s'", cookiejar)
+        os.remove(cookiejar)
+    except OSError as e:
+        log.debug(e)
 
     log.info("Finished clearing authentication")
-
-
-def read_config(args, appname=None, authfile=None):
-    appname   = appname   or APPNAME
-    authfile  = authfile  or AUTHFILE
-
-    username = ""
-    password = ""
-
-    # read
-    if keyring:
-        log.debug("Reading credentials from keyring")
-        try:
-            username, password = (
-                keyring.get_password(appname, appname).split('\n') +
-                ['\n']
-            )[:2]
-        except AttributeError as e:
-            # Check for old keyring format and migrate before throwing warning
-            data = keyring.get_password(appname, '')
-            if data:
-                log.info("Migrating credentials to new keyring format")
-                keyring.set_password(appname, appname, data)
-                try:
-                    keyring.delete_password(appname, '')
-                except AttributeError as e:
-                    log.warning("Error deleting old keyring. Outdated library? (%s)", e)
-            else:
-                log.warning("Credentials not found in keyring. First time usage?")
-        except IOError as e:  # keyring sometimes raises this
-            log.error(e)
-    else:
-        log.debug("Reading credentials from '%s'" % authfile)
-        try:
-            with open(authfile, 'r') as fd:
-                username, password = (fd.read().splitlines() + ['\n'])[:2]
-        except IOError as e:
-            if e.errno == 2:  # No such file or directory
-                log.warning("Credentials file not found. First time usage?")
-            else:
-                log.error(e)
-
-    # save
-    if args.username or args.password:
-        log.info("Saving credentials")
-        if keyring:
-            keyring.set_password(appname, appname,
-                                 '%s\n%s' % (args.username or username,
-                                             args.password or password,))
-        else:
-            try:
-                with open(authfile, 'w') as fd:
-                    fd.write("%s\n%s\n" % (args.username or username,
-                                           args.password or password,))
-                os.chmod(authfile, 0o600)
-            except IOError as e:
-                log.error(e)
-
-    return dict(username=username,
-                password=password,)
 
 
 def parseargs(argv=None):
@@ -945,10 +813,6 @@ def parseargs(argv=None):
                             " rebuilding the cache")
 
     group = parser.add_argument_group("Authentication Options")
-    group.add_argument('-U', '--username', dest='username',
-                        help="Account login, the user's email")
-    group.add_argument('-P', '--password', dest='password',
-                        help="Account password")
     group.add_argument('-A', '--auth', dest='auth',
                         help="Account _simpleauth_sess cookie value")
     group.add_argument('-c', '--code',
@@ -1029,12 +893,11 @@ def parseargs(argv=None):
 
 
 def cli():
-    global APPNAME, CONFIGDIR, CACHEDIR, AUTHFILE, COOKIEJAR
+    global APPNAME, CONFIGDIR, CACHEDIR, COOKIEJAR
 
     APPNAME   = osp.basename(osp.splitext(__file__)[0])
     CONFIGDIR = xdg.save_config_path(APPNAME)  # creates the dir
     CACHEDIR  = osp.join(xdg.xdg_cache_home, APPNAME)
-    AUTHFILE  = osp.join(CONFIGDIR, "login.conf")
     COOKIEJAR = osp.join(CONFIGDIR, "cookies.txt")
     # No changes in DATADIR
 
