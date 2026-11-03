@@ -290,6 +290,24 @@ Downloads run one at a time; expired download links are refreshed
 automatically.
 
 
+Terminal interface
+------------------
+
+`hb-tui` browses your cached bundles and games, and downloads them to the
+download folder. Browsing makes no network requests.
+
+- `/` filters by name, `p`/`P` cycle the platform, `h` shows items without
+  downloads, `e`/`c` expand and collapse all bundles, `l` toggles the log.
+- `d` downloads the selected bundle, or only the selected game in it, for the
+  selected platform. It shows what will be downloaded, and the free disk space,
+  before starting. It asks for the download folder and session cookie the first
+  time they are needed.
+- Downloads run one file at a time in the background; `d` on more bundles
+  queues them. `x` cancels, keeping partial files to resume later.
+- Markers show what is downloaded: `✓` all files, `◐` some, `!` files that
+  changed on the server or locally.
+
+
 Usage as a library
 ------------------
 

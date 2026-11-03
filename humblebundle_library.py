@@ -220,6 +220,8 @@ class FileJob:
     status: str = MISSING
     partial_size: int = 0
     human_size: str = ""
+    # All games of the bundle that list this file, starting with game
+    games: list = field(default_factory=list)
 
     @property
     def remaining(self):
@@ -342,8 +344,9 @@ class Library:
             if unknown:
                 raise LibraryError("Not in bundle '%s': %s" %
                                    (bundle, ", ".join(unknown)))
-            available = [g for g in available if g in games]
 
+        # Plan the whole bundle, even for some games only, so each file
+        # gets the same path either way
         jobs = []
         seen = {}
         for game in available:
@@ -354,6 +357,8 @@ class Library:
                     job = self._job(bundle, game, plat, d, seen)
                     if job:
                         jobs.append(job)
+        if games:
+            jobs = [job for job in jobs if set(job.games) & set(games)]
         return jobs
 
     def _job(self, bundle, game, platform, download, seen):
@@ -366,20 +371,28 @@ class Library:
         relpath = "/".join(parts)
         key = relpath.lower()  # macOS and Windows ignore case
         if key in seen:
-            if seen[key] == md5:
-                return None  # the same file, listed twice or by two games
+            if seen[key].md5 == md5:
+                # The same file, listed twice or by two games
+                if game not in seen[key].games:
+                    seen[key].games.append(game)
+                return None
             # A different file with the same name: keep both
             stem, ext = osp.splitext(parts[-1])
             parts[-1] = "%s-%s%s" % (stem, md5[:8] or "dup", ext)
             relpath = "/".join(parts)
             key = relpath.lower()
-        seen[key] = md5
+            if key in seen:
+                if game not in seen[key].games:
+                    seen[key].games.append(game)
+                return None
 
         job = FileJob(bundle=bundle, game=game, platform=platform,
                       name=download.get('name', ''), relpath=relpath,
                       path=osp.join(self.folder, *parts),
                       size=int(download.get('file_size') or 0), md5=md5,
-                      human_size=download.get('human_size', ''))
+                      human_size=download.get('human_size', ''),
+                      games=[game])
+        seen[key] = job
         self.update_status(job)
         return job
 

@@ -154,6 +154,13 @@ def prompt_auth(appname=None):
     '''Prompt for the session cookie and save it in the keyring'''
     auth = getpass.getpass("Paste the value of the _simpleauth_sess cookie"
                            " (input is hidden): ").strip().strip('"')
+    return save_auth(auth, appname)
+
+
+def save_auth(auth, appname=None):
+    '''Validate the session cookie value and save it in the keyring.
+    Return it, stripped of spaces and quotes.'''
+    auth = auth.strip().strip('"')
     if not auth:
         raise HumbleBundleError("No session cookie entered")
     auth_expiry(auth)  # validate before saving
@@ -210,25 +217,7 @@ class HumbleBundle(httpbot.HttpBot):
                             " Run with --auth to set it")
 
         if auth:
-            log.info("Injecting authenticated cookie")
-            expires = auth_expiry(auth)
-            cookie = cookielib.Cookie(version = 0,
-                                      name = '_simpleauth_sess',
-                                      value = auth,
-                                      port = None,
-                                      port_specified = False,
-                                      domain = urlsplit(self.url)[1],
-                                      domain_specified = False,
-                                      domain_initial_dot = False,
-                                      path = '/',
-                                      path_specified = False,
-                                      secure = True,
-                                      expires = expires,
-                                      discard = False,
-                                      comment = None,
-                                      comment_url = None,
-                                      rest={},)
-            self.cookiejar.set_cookie(cookie)
+            self.set_auth(auth)
 
         super(HumbleBundle, self).__init__(self.url,
                                            tag=APPNAME,
@@ -244,6 +233,31 @@ class HumbleBundle(httpbot.HttpBot):
 
         if not self.load() and autoupdate:
             self.update()
+
+
+    def set_auth(self, auth):
+        '''Use auth, the _simpleauth_sess cookie value, for later requests.
+        Raise HumbleBundleError if it is not a valid cookie value.
+        '''
+        log.info("Injecting authenticated cookie")
+        expires = auth_expiry(auth)
+        cookie = cookielib.Cookie(version = 0,
+                                  name = '_simpleauth_sess',
+                                  value = auth,
+                                  port = None,
+                                  port_specified = False,
+                                  domain = urlsplit(self.url)[1],
+                                  domain_specified = False,
+                                  domain_initial_dot = False,
+                                  path = '/',
+                                  path_specified = False,
+                                  secure = True,
+                                  expires = expires,
+                                  discard = False,
+                                  comment = None,
+                                  comment_url = None,
+                                  rest={},)
+        self.cookiejar.set_cookie(cookie)
 
 
     def load(self):
