@@ -34,12 +34,17 @@ import threading
 import subprocess
 import shlex
 import shutil
-import queue
+import getpass
 import http.cookiejar as cookielib
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlsplit, parse_qs
 
 # PyPI: pyxdg
 import xdg.BaseDirectory as xdg
+
+# PyPI: keyring
+import keyring
+import keyring.errors
 
 
 import httpbot
@@ -56,9 +61,47 @@ CONFIGDIR = osp.join(xdg.xdg_config_home, APPNAME)
 CACHEDIR  = osp.join(xdg.xdg_cache_home, APPNAME)
 COOKIEJAR = osp.join(CONFIGDIR, "cookies.txt")
 
+# Keyring entry holding the _simpleauth_sess session cookie.
+# The service name is APPNAME.
+KEYRING_USER = "SESSION_COOKIE"
+
+# Maximum number of simultaneous requests made by --update
+DEFAULT_CONNECTIONS = 4
+
 
 class HumbleBundleError(Exception):
     pass
+
+
+def auth_expiry(auth):
+    '''Return the expiry timestamp for a _simpleauth_sess cookie value.
+
+    The value has the format "<data>|<timestamp>|<signature>".
+    Raise HumbleBundleError if it does not.
+    '''
+    parts = auth.split('|')
+    if len(parts) != 3 or not parts[1].isdigit():
+        raise HumbleBundleError(
+            "Invalid _simpleauth_sess cookie: expected 3 fields separated"
+            " by '|', with a numeric timestamp in the middle")
+    return int(parts[1]) + 730 * 24 * 60 * 60
+
+
+def read_auth(appname=None):
+    '''Return the session cookie saved in the keyring, or None'''
+    return keyring.get_password(appname or APPNAME, KEYRING_USER)
+
+
+def prompt_auth(appname=None):
+    '''Prompt for the session cookie and save it in the keyring'''
+    auth = getpass.getpass("Paste the value of the _simpleauth_sess cookie"
+                           " (input is hidden): ").strip().strip('"')
+    if not auth:
+        raise HumbleBundleError("No session cookie entered")
+    auth_expiry(auth)  # validate before saving
+    keyring.set_password(appname or APPNAME, KEYRING_USER, auth)
+    log.info("Session cookie saved in the keyring")
+    return auth
 
 class HumbleBundle(httpbot.HttpBot):
 
@@ -66,9 +109,20 @@ class HumbleBundle(httpbot.HttpBot):
     url = "https://www.humblebundle.com"
     auth_urls = ("/login", "/user/humbleguard")
 
-    def __init__(self, auth=None, code=None,
+    def __init__(self, auth=None,
                  datadir=None, configdir=None, cachedir=None, cookiejar=None,
-                 debug=False):
+                 connections=DEFAULT_CONNECTIONS, debug=False):
+        '''auth is the _simpleauth_sess cookie value.
+        If omitted, it is read from the keyring.
+        connections is the maximum number of simultaneous requests
+        made by update().
+        '''
+        if connections < 1:
+            raise HumbleBundleError("connections must be at least 1")
+        self.connections = connections
+        # Serializes writes to the cookies file from concurrent requests
+        self._cookie_lock = threading.Lock()
+
         self.datadir   = datadir   or DATADIR
         self.configdir = configdir or CONFIGDIR
         self.cachedir  = cachedir  or CACHEDIR
@@ -84,9 +138,15 @@ class HumbleBundle(httpbot.HttpBot):
         except (IOError, cookielib.LoadError) as e:
             log.error('Error reading cookies: %s', e)
 
+        if auth is None:
+            auth = read_auth()
+            if not auth:
+                log.warning("No session cookie in the keyring."
+                            " Run with --auth to set it")
+
         if auth:
             log.info("Injecting authenticated cookie")
-            expires = int(auth.split('|')[1]) + 730 * 24 * 60 * 60
+            expires = auth_expiry(auth)
             cookie = cookielib.Cookie(version = 0,
                                       name = '_simpleauth_sess',
                                       value = auth,
@@ -109,26 +169,6 @@ class HumbleBundle(httpbot.HttpBot):
                                            tag=APPNAME,
                                            cookiejar=self.cookiejar,
                                            debug=debug)
-
-        if code:
-            log.info("Validating browser code at '%s/user/humbleguard'",
-                     self.url)
-            try:
-                # Load coockies in unlikely case that cookies.txt was not present
-                self.get("/")
-                token = None
-                for cookie in self.cookiejar:
-                    if cookie.name == 'csrf_cookie':
-                        token = cookie.value
-                if token is None:
-                    raise HumbleBundleError("Missing CSRF token")
-                self.get("/user/humbleguard",
-                               {'goto': "/home",
-                                'qs'  : "",
-                                '_le_csrf_token'  : token,
-                                'code': code.upper()})
-            except httpbot.HTTPError as e:
-                raise HumbleBundleError("Incorrect browser verification code")
 
         # "purchases" in the website. May be non-bundle like Store Purchases
         self.bundles = {}
@@ -174,9 +214,6 @@ class HumbleBundle(httpbot.HttpBot):
 
     def update(self):
         '''Fetch all bundles and games from the server, rebuilding the cache'''
-        self.bundles = {}
-        self.games   = {}
-
         # Get the keys
         log.info("Retrieving keys from '%s/home/keys'", self.url)
         match = re.search(r'^.*[\'"]?gamekeys[\'"]?\s*[:=]\s*(\[.*\])',
@@ -185,18 +222,35 @@ class HumbleBundle(httpbot.HttpBot):
         if not match:
             raise HumbleBundleError("GameKeys list not found")
 
-        # Loop the bundles
-        results = queue.Queue()
+        # Loop the bundles, with at most self.connections requests at a time.
+        # Build into new dicts so a failure leaves the current data untouched.
         keys = json.loads(match.groups()[0])
-        for key in keys:
-            t = threading.Thread(target=self._load_key, args=(key, True, results))
-            t.daemon = True
-            t.start()
+        bundles = {}
+        games = {}
+        log.info("Retrieving %d orders using %d connection(s)",
+                 len(keys), self.connections)
+        with ThreadPoolExecutor(max_workers=self.connections) as pool:
+            futures = [pool.submit(self._load_key, key, True) for key in keys]
+            # Collect in the original order of keys
+            for i, (key, future) in enumerate(zip(keys, futures), 1):
+                try:
+                    bundle, bundle_games = future.result()
+                except (httpbot.HTTPError, OSError, ValueError) as e:
+                    pool.shutdown(wait=True, cancel_futures=True)
+                    log.debug("Failed order key: %s", key)
+                    raise HumbleBundleError(
+                        "Update aborted at order %d of %d: %s."
+                        " Cached data was not changed." % (i, len(keys), e))
+                bundles.update(bundle)
+                games.update(bundle_games)
+                for info in bundle.values():
+                    log.info("[%d/%d] %s (%d items)", i, len(keys),
+                             info.get('human_name') or
+                             info.get('machine_name', '?'),
+                             len(bundle_games))
 
-        for __ in range(len(keys)):
-            bundle, games = results.get()
-            self.bundles.update(bundle)
-            self.games.update(games)
+        self.bundles = bundles
+        self.games   = games
 
         log.info("Updated %d games from %d bundles",
                  len(self.games),
@@ -217,10 +271,10 @@ class HumbleBundle(httpbot.HttpBot):
                 log.error("Error saving cache data: %s", e)
 
 
-    def _load_key(self, key, batch=False, queue=None):
+    def _load_key(self, key, batch=False):
 
         url = "/api/v1/order/%s" % key
-        log.info("Retrieving purchase info from '%s%s'", self.url, url)
+        log.debug("Retrieving purchase info from '%s%s'", self.url, url)
         bundle = json.load(self.get(url))
         bundle['games'] = []  # made-up field: list of games it contains
         bundlekey = bundle['product']['machine_name']
@@ -253,12 +307,7 @@ class HumbleBundle(httpbot.HttpBot):
 
         # Batch-processing: do not update nor save bundles and games dict
         if batch:
-            out = ({bundlekey:bundle}, games)
-            if queue:
-                queue.put(out)
-                return
-            else:
-                return out
+            return ({bundlekey:bundle}, games)
 
         # Add bundle to bundles list
         self.games.update(games)
@@ -639,8 +688,9 @@ class HumbleBundle(httpbot.HttpBot):
             if force or 'Set-Cookie' in res.info():
                 log.debug("Saving cookies to '%s'", self.cookiejar.filename)
                 try:
-                    self.cookiejar.save()
-                    os.chmod(self.cookiejar.filename, 0o600)
+                    with self._cookie_lock:
+                        self.cookiejar.save()
+                        os.chmod(self.cookiejar.filename, 0o600)
                 except IOError as e:
                     log.error("Error saving cookies: %s", e)
 
@@ -660,16 +710,10 @@ class HumbleBundle(httpbot.HttpBot):
             if not e.code == 401:
                 raise
 
-        # Humble Guard (Browser Verification Code sent via email)
-        if current_url == "/user/humbleguard":
-            raise HumbleBundleError(
-                    "Browser verification code required."
-                    " Check your email and retry with --code")
-
         # Login required: the session cookie is missing or expired
         raise HumbleBundleError(
-            "Not logged in. Log in using a real browser, inspect the cookies"
-            " created and provide the value of _simpleauth_sess with --auth")
+            "Not logged in. Log in using a real browser, copy the value of"
+            " the _simpleauth_sess cookie and run again with --auth")
 
 
 
@@ -680,7 +724,9 @@ def main(argv=None):
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), None),
                         format='%(asctime)s\t%(levelname)-8s\t%(message)s')
     log.debug(args)
-    hb = HumbleBundle(auth=args.auth, code=args.code, debug=args.debug)
+    auth = prompt_auth() if args.auth else None
+    hb = HumbleBundle(auth=auth, connections=args.connections,
+                      debug=args.debug)
 
     if args.update:
         hb.update()
@@ -780,12 +826,19 @@ def main(argv=None):
             parser.print_usage()
 
 
-def clear_auth(cookiejar=None):
+def clear_auth(appname=None, cookiejar=None):
     '''Clear all authentication data and delete related files'''
 
+    appname   = appname   or APPNAME
     cookiejar = cookiejar or COOKIEJAR
 
     log.info("Clearing all authentication data")
+
+    try:
+        log.debug("Removing session cookie from the keyring")
+        keyring.delete_password(appname, KEYRING_USER)
+    except keyring.errors.PasswordDeleteError as e:
+        log.debug(e)
 
     try:
         log.debug("Deleting '%s'", cookiejar)
@@ -812,11 +865,28 @@ def parseargs(argv=None):
                         help="Fetch all games and bundles data from the server,"
                             " rebuilding the cache")
 
+    def positive_int(value):
+        try:
+            number = int(value)
+        except ValueError:
+            number = 0
+        if number < 1:
+            raise argparse.ArgumentTypeError(
+                "must be a whole number of 1 or more: %r" % value)
+        return number
+
+    parser.add_argument('-n', '--connections', dest='connections',
+                        type=positive_int, default=DEFAULT_CONNECTIONS,
+                        metavar="N",
+                        help="Maximum number of simultaneous connections"
+                            " used by --update. Use 1 for one request at a"
+                            " time. Default is %d" % DEFAULT_CONNECTIONS)
+
     group = parser.add_argument_group("Authentication Options")
     group.add_argument('-A', '--auth', dest='auth',
-                        help="Account _simpleauth_sess cookie value")
-    group.add_argument('-c', '--code',
-                       help="Browser verification code sent by email")
+                        default=False, action="store_true",
+                        help="Prompt for the _simpleauth_sess session cookie"
+                            " and save it in the keyring")
     group.add_argument('-C', '--clear',
                        default=False, action="store_true",
                        help="Clear all authentication data, deleting related files")

@@ -46,7 +46,7 @@ This installs both the main script `humblebundle` and the library `humblebundle`
 Uninstall
 ---------
 
-Remove authentication files:
+Remove the session cookie from the keyring and delete the cookies file:
 
 	humblebundle --clear
 
@@ -82,14 +82,18 @@ Adapted from `--help`:
 	  -u|--update
 		                Fetch all games and bundles data from the server,
 		                rebuilding the cache
+	  -n|--connections N
+		                Maximum number of simultaneous connections used by
+		                --update. Use 1 for one request at a time.
+		                Default is 4
 
-	Login options:
-	  -U|--username USERNAME
-		                Account login, the user's email
-	  -P|--password PASSWORD
-		                Account password
-	  -A|--auth AUTH
-		                Account _simpleauth_sess cookie
+	Authentication options:
+	  -A|--auth
+		                Prompt for the _simpleauth_sess session cookie
+		                and save it in the keyring
+	  -C|--clear
+		                Clear all authentication data: the session cookie
+		                in the keyring and the cookies file
 
 
 	Commands:
@@ -160,9 +164,21 @@ Command line interface is heavily inspired on `apt` workflow:
 Examples and sample output:
 ---------------------------
 
-Authenticating (only needed once, it stores credentials in keyring):
+Authenticating (only needed once, and again when the session expires):
 
-	$ humblebundle --username 'user@gmail.com' --password '1234' --update --list
+1. Log in to <https://www.humblebundle.com> in a web browser.
+2. Open the browser's developer tools and find the cookies for
+   `www.humblebundle.com`. Copy the value of the `_simpleauth_sess` cookie.
+   It looks like `<data>|<timestamp>|<signature>`.
+3. Run `--auth` and paste the value at the prompt. The input is hidden, and the
+   cookie is saved in the system keyring (service `humblebundle`, username
+   `SESSION_COOKIE`):
+
+	$ humblebundle --auth --update
+	Paste the value of the _simpleauth_sess cookie (input is hidden):
+
+Later runs read the cookie from the keyring. If it expires, the tool reports
+"Not logged in" and you can repeat the steps above.
 
 
 Show bundle and game info:
@@ -243,24 +259,26 @@ Usage as a library
 
     import humblebundle
 
-    hb = HumbleBundle('user@gmail.com', '1234')
+    # Uses the session cookie saved in the keyring by `humblebundle --auth`.
+    # Or pass it directly: humblebundle.HumbleBundle(auth='<_simpleauth_sess value>')
+    hb = humblebundle.HumbleBundle()
 
     hb.update()
 
     for name in hb.games:
         game = hb.get_game(name)
           # or simply hb.games[name] - It's a dictonary! (for now)
-        print game['human_name']
+        print(game['human_name'])
 
         # Blame Humble Bundle for their weird dictionary structure, not me!
         for platforms in game.get('downloads', []):
             for download in platforms.get('download_struct', []):
                 url = download.get('url', {}).get('web', '')
                 if url:
-                   print url
+                    print(url)
 
 
-    filename = hb.download('dontmove', platform='linux', arch=64)
+    filename = hb.download('dontmove', platform='linux', arch='64')
 
 ---
 
