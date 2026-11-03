@@ -255,6 +255,31 @@ Install a game (may require an entry in `gamedata.json` or manual options):
 	Done!
 
 
+Download folder
+---------------
+
+Keep a local copy of your bundles in one folder. Set it once; it is saved in
+`config.ini` in the config folder, and must already exist:
+
+	$ hb --download-folder /Volumes/Archive/HumbleBundle
+
+Download every file of a bundle, or only some of its games, optionally for one
+platform. Files go to `BUNDLE/GAME/PLATFORM/FILE` in the folder, so a game
+downloaded on its own lands where it would as part of its bundle. Use
+`_unbundled` for games that are not in any bundle:
+
+	$ hb --sync hib5
+	$ hb --sync hib5 braid --platform mac
+	$ hb --sync hib5 --dry-run
+
+A `manifest.json` in the folder records each downloaded file and its MD5.
+Running `--sync` again skips files you already have and resumes interrupted
+downloads. If Humble publishes a new version of a file, or a local file no
+longer matches what was downloaded, it is reported but not replaced.
+Downloads run one at a time; expired download links are refreshed
+automatically.
+
+
 Usage as a library
 ------------------
 

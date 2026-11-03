@@ -34,6 +34,15 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
+# Suffix of files being downloaded by HttpBot.fetch()
+PART_SUFFIX = ".part"
+
+
+class DownloadError(Exception):
+    """ A downloaded file does not match its expected size or MD5 """
+    pass
+
+
 class HttpBot:
     """ Base class for other handling basic http tasks like requesting a page,
         download a file and cache content. Not to be used directly
@@ -49,18 +58,134 @@ class HttpBot:
             netloc, _, path = path.partition('/')
         self.base_url = urllib.parse.urlunsplit((scheme, netloc, path, q, f))
 
-    def get(self, url, postdata=None):
+    def get(self, url, postdata=None, headers=None):
         """ Send an HTTP request, either GET (if no postdata) or POST
             Keeps session and other cookies.
             postdata is a dict with name/value pairs
+            headers is a dict of extra request headers
             url can be absolute or relative to base_url
         """
         url = urllib.parse.urljoin(self.base_url, url)
+        data = None
         if postdata:
             data = urllib.parse.urlencode(postdata).encode('ascii')
-            return self._opener.open(url, data)
-        else:
+        if headers:
+            url = urllib.request.Request(url, data=data, headers=headers)
             return self._opener.open(url)
+        return self._opener.open(url, data)
+
+    def fetch(self, url, path, md5sum=None, expected_size=0,
+              progress=True, callback=None, cancel=None, chunk_size=0):
+        """ Download url to exactly path, resuming a previous attempt.
+
+            Data goes to path + PART_SUFFIX, which is renamed to path once
+            complete and verified against expected_size and md5sum, when
+            given. If the partial file exists, only the remaining bytes are
+            requested; if the server does not support that, the download
+            restarts from the beginning.
+
+            Return path, or None if cancelled. On cancel or Ctrl+C the
+            partial file is kept so a later call resumes it.
+            Raise DownloadError, removing the partial file, if the result
+            does not match expected_size or md5sum.
+
+            callback, if given, is called as callback(done, total) and
+            replaces the console progress bar. total is 0 if unknown.
+            cancel, if given, is a threading.Event that stops the download.
+        """
+        chunk_size = chunk_size or 256*1024
+        part = path + PART_SUFFIX
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+
+        offset = os.path.getsize(part) if os.path.isfile(part) else 0
+        if expected_size and offset > expected_size:
+            log.warning("Partial file is larger than expected, restarting: %s",
+                        part)
+            os.remove(part)
+            offset = 0
+
+        # Hash the data already on disk, then each new chunk, so the file is
+        # read only once
+        hashobj = hashlib.md5() if md5sum else None
+        response = None
+        if not (expected_size and offset == expected_size):
+            headers = {'Range': 'bytes=%d-' % offset} if offset else None
+            try:
+                response = self.get(url, headers=headers)
+            except HTTPError as e:
+                # 416: nothing left to send, so the partial file is complete
+                if not (e.code == 416 and offset):
+                    raise
+            if response is not None and offset and response.getcode() != 206:
+                log.info("Server does not support resuming, restarting %s",
+                         os.path.basename(path))
+                offset = 0
+
+        if offset:
+            log.info("Resuming %s at %d bytes", os.path.basename(path), offset)
+            if hashobj:
+                filehash(part, hashobj)
+
+        done = offset
+        total = expected_size
+        if response is not None and not total:
+            length = int(response.info().get('Content-Length', 0))
+            total = offset + length if length else 0
+
+        show = (progress and progressbar and not callback and
+                response is not None)
+        if show:
+            pbar = progressbar.ProgressBar(widgets=[
+                ' ', progressbar.Percentage(),
+                ' of %.1f MiB' % (total/1024.0**2),
+                ' ', progressbar.Bar('.'),
+                ' ', progressbar.FileTransferSpeed(),
+                ' ', progressbar.ETA(),
+                ' '], max_value=total or progressbar.UnknownLength,
+                initial_value=offset).start()
+        if callback:
+            callback(done, total)
+
+        cancelled = False
+        try:
+            if response is not None:
+                with open(part, 'ab' if offset else 'wb') as f:
+                    for data in iter(lambda: response.read(chunk_size), b''):
+                        if cancel is not None and cancel.is_set():
+                            cancelled = True
+                            break
+                        f.write(data)
+                        if hashobj:
+                            hashobj.update(data)
+                        done += len(data)
+                        if show:
+                            pbar.update(min(total, done) if total else done)
+                        if callback:
+                            callback(done, total)
+        finally:
+            if response is not None:
+                response.close()
+            if show:
+                pbar.finish()
+
+        if cancelled:
+            log.info("Download cancelled, keeping %s", part)
+            return None
+
+        size = os.path.getsize(part)
+        if expected_size and size != expected_size:
+            os.remove(part)
+            raise DownloadError("Size of %s is %d bytes, expected %d" %
+                                (os.path.basename(path), size, expected_size))
+        if hashobj and hashobj.hexdigest() != md5sum.lower():
+            os.remove(part)
+            raise DownloadError("MD5 of %s does not match: expected %s, got %s"
+                                % (os.path.basename(path), md5sum,
+                                   hashobj.hexdigest()))
+        os.replace(part, path)
+        return path
 
     def download(self, url, path=None, md5sum=None, expected_size=0,
                  progress=True, keep_partial=False, chunk_size=0,

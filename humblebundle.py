@@ -35,6 +35,8 @@ import subprocess
 import shlex
 import shutil
 import getpass
+import configparser
+import tempfile
 import http.cookiejar as cookielib
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlsplit, parse_qs
@@ -110,6 +112,43 @@ def read_auth(appname=None):
     return keyring.get_password(appname or APPNAME, KEYRING_USER)
 
 
+def config_path(configdir=None):
+    '''Return the path of the config.ini file'''
+    return osp.join(configdir or CONFIGDIR, "config.ini")
+
+
+def read_config(configdir=None):
+    '''Return the settings in config.ini as a ConfigParser.
+    A missing file gives empty settings.
+    '''
+    config = configparser.ConfigParser()
+    path = config_path(configdir)
+    try:
+        with open(path, encoding='utf-8') as fp:
+            config.read_file(fp)
+    except FileNotFoundError:
+        pass
+    except configparser.Error as e:
+        raise HumbleBundleError("Invalid config file '%s': %s" % (path, e))
+    return config
+
+
+def write_config(config, configdir=None):
+    '''Save a ConfigParser to config.ini, replacing it atomically'''
+    path = config_path(configdir)
+    os.makedirs(osp.dirname(path), 0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=osp.dirname(path), prefix=".config.")
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fp:
+            config.write(fp)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        os.remove(tmp)
+        raise
+    log.info("Saved settings to '%s'", path)
+
+
 def prompt_auth(appname=None):
     '''Prompt for the session cookie and save it in the keyring'''
     auth = getpass.getpass("Paste the value of the _simpleauth_sess cookie"
@@ -145,6 +184,8 @@ class HumbleBundle(httpbot.HttpBot):
         self.connections = connections
         # Serializes writes to the cookies file from concurrent requests
         self._cookie_lock = threading.Lock()
+        # Serializes changes to bundles and games from other threads
+        self._data_lock = threading.Lock()
 
         self.datadir   = datadir   or DATADIR
         self.configdir = configdir or CONFIGDIR
@@ -308,6 +349,17 @@ class HumbleBundle(httpbot.HttpBot):
                  len(self.bundles))
         self._merge()
         self._save_data()
+
+
+    def refresh_order(self, key):
+        '''Reload one order (bundle) from the server, which also gives fresh
+        download links for its games, and save the cache'''
+        with self._data_lock:
+            bundle, games = self._load_key(key, batch=True)
+            self.bundles.update(bundle)
+            self.games.update(games)
+            self._merge()
+            self._save_data()
 
 
     def _save_data(self):
@@ -820,7 +872,7 @@ class HumbleBundle(httpbot.HttpBot):
                                    key=lambda k: k['platform'])]
 
 
-    def get(self, url, postdata=None):
+    def get(self, url, postdata=None, headers=None):
 
         def urlabspath(url):
             return urlsplit(urljoin('/', url)).path.lower()
@@ -838,7 +890,7 @@ class HumbleBundle(httpbot.HttpBot):
         requested_url = urlabspath(url)
         current_url = ""
         try:
-            res = super(HumbleBundle, self).get(url, postdata)
+            res = super(HumbleBundle, self).get(url, postdata, headers)
             save_cookies(res)
             # Was it successful? That is, not redirected TO an authorization
             # page that requires special handling.
@@ -865,6 +917,19 @@ def main(argv=None):
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), None),
                         format='%(asctime)s\t%(levelname)-8s\t%(message)s')
     log.debug(args)
+
+    # Needs no game data, so do it before loading (and maybe fetching) it
+    if args.download_folder is not None:
+        import humblebundle_library as library
+        if args.download_folder is True:
+            folder = library.get_folder()
+            print(folder or "No download folder set")
+        else:
+            print("Download folder: %s" %
+                  library.set_folder(args.download_folder))
+        if not args.sync and not args.update and not args.auth:
+            return
+
     auth = prompt_auth() if args.auth else None
     hb = HumbleBundle(auth=auth, connections=args.connections,
                       debug=args.debug)
@@ -875,9 +940,16 @@ def main(argv=None):
     if args.clear:
         clear_auth()
 
-    if args.list is not None:
+    # Without --platform, --list and --download use linux, --sync uses all
+    platform = args.platform or "linux"
+
+    if args.sync:
+        return sync(hb, args.sync[0], args.sync[1:], args.platform,
+                    dry_run=args.dry_run)
+
+    elif args.list is not None:
         regex = args.list if isinstance(args.list, str) else None
-        for key in hb.list_games(regex=regex, platform=args.platform):
+        for key in hb.list_games(regex=regex, platform=platform):
             print("%s" % (hb.games[key]['human_name'] if args.human else key))
 
     elif args.show:
@@ -939,7 +1011,7 @@ def main(argv=None):
                            dtype=args.type,
                            arch=args.arch,
                            bittorrent=args.bittorrent,
-                           platform=args.platform,
+                           platform=platform,
                            serverfile=args.serverfile):
             return 1
 
@@ -950,8 +1022,57 @@ def main(argv=None):
         hb.uninstall(args.uninstall, args.method)
 
     else:
-        if not (args.update or args.clear):
+        if not (args.update or args.clear or
+                args.download_folder is not None):
             parser.print_usage()
+
+
+def sync(hb, bundle, games=None, platform=None, dry_run=False):
+    '''Download the files of a bundle, or of some of its games, to the
+    download folder. Return the exit code.'''
+    import humblebundle_library as library
+    lib = library.Library(hb)
+    lib.check_folder()
+    jobs = lib.plan(bundle, games, platform)
+    counts = lib.summary(jobs)
+    name = ("Games in no bundle" if bundle == library.UNBUNDLED
+            else hb.get_bundle(bundle).get('human_name', bundle))
+
+    print("%s [%s]%s: %d files" % (
+        name, bundle, " (%s)" % platform if platform else "", len(jobs)))
+    print("  %s" % ", ".join("%d %s" % (counts[s], s)
+                             for s in (library.MISSING, library.PARTIAL,
+                                       library.HAVE, library.UNTRACKED,
+                                       library.CHANGED, library.MODIFIED)
+                             if counts[s]))
+    print("  To download: %s, free: %s in %s" % (
+        library.human_bytes(counts['bytes']),
+        library.human_bytes(counts['free']), lib.folder))
+
+    if dry_run:
+        for job in jobs:
+            print("%-10s %10s  %s" % (job.status, job.human_size, job.relpath))
+        return 0
+
+    def on_file(job, index, count):
+        if job.status in library.TO_DOWNLOAD:
+            print("[%d/%d] %s%s (%s)" % (
+                index, count, job.relpath,
+                " (resuming)" if job.status == library.PARTIAL else "",
+                job.human_size))
+
+    result = lib.sync(jobs, on_file=on_file)
+
+    print("Downloaded %d, already had %d, flagged %d, failed %d" % (
+        len(result.downloaded), len(result.skipped),
+        len(result.flagged), len(result.failed)))
+    for job in result.flagged:
+        print("  %s: %s" % (job.status, job.relpath))
+    for job, error in result.failed:
+        print("  failed: %s: %s" % (job.relpath, error))
+    if result.cancelled:
+        print("Cancelled. Run again to resume.")
+    return 1 if result.failed or result.cancelled else 0
 
 
 def clear_auth(appname=None, cookiejar=None):
@@ -1041,6 +1162,27 @@ def parseargs(argv=None):
                         help="Install selected game")
     group.add_argument('-I', '--uninstall', dest='uninstall', metavar="GAME",
                         help="Uninstall selected game")
+    group.add_argument('-Y', '--sync', dest='sync', nargs='+',
+                        metavar=("BUNDLE", "GAME"),
+                        help="Download all files of BUNDLE, or only of the"
+                            " given GAMEs in it, to the download folder,"
+                            " as BUNDLE/GAME/PLATFORM/FILE. Files already"
+                            " downloaded are skipped, interrupted ones are"
+                            " resumed and files changed on the server are"
+                            " reported but not replaced. Use _unbundled"
+                            " for games in no bundle. All platforms, unless"
+                            " --platform is given.")
+
+    group = parser.add_argument_group("Download Folder Options")
+    group.add_argument('-o', '--download-folder', dest='download_folder',
+                        nargs='?', const=True, metavar="PATH",
+                        help="Set the folder used by --sync, saving it in"
+                            " config.ini. The folder must exist. Without"
+                            " PATH, show the current folder.")
+    group.add_argument('-N', '--dry-run', dest='dry_run',
+                        default=False, action="store_true",
+                        help="With --sync, list each file and its status"
+                            " without downloading")
 
     group = parser.add_argument_group("List Options")
     group.add_argument('-H', '--human', dest='human',
@@ -1060,12 +1202,13 @@ def parseargs(argv=None):
     group.add_argument('-a', '--arch', dest='arch', choices=['32', '64'],
                         help="Download architecture: 32-bit (also known as i386)"
                             " or 64-bit (amd64, x86_64, etc)")
-    default = "linux"
     group.add_argument('-p', '--platform', dest='platform',
-                        default=default,
+                        default=None,
                         choices=['windows', 'mac', 'linux', 'android', 'audio',
-                                 'ebook', 'comedy', 'video'],
-                        help="Download platform. Default is '%s'" % default)
+                                 'ebook', 'comedy', 'video', 'other'],
+                        help="Download platform. Default is 'linux' for"
+                            " --list and --download, and all platforms"
+                            " for --sync")
     group.add_argument('-F', '--server-file', dest='serverfile', metavar="FILE",
                         help="Basename of the server file to download."
                             " Useful when no combination of --type, --arch"
