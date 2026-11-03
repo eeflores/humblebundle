@@ -19,7 +19,7 @@
 
 '''Read-only browser for the cached Humble Bundle games and bundles.
 
-It only reads the cache written by `humblebundle --update`: it makes no
+It only reads the cache written by `hb --update`: it makes no
 network requests and does not download, install or uninstall anything.
 '''
 
@@ -178,7 +178,7 @@ class HumbleBundleApp(App):
         self.hb = hb
         if not hb.has_data():
             self._show_message(
-                "No cached data in %s\n\nRun [b]humblebundle --update[/b]"
+                "No cached data in %s\n\nRun [b]hb --update[/b]"
                 " to fetch your games and bundles, then start this again."
                 % escape(hb.configdir))
             return
@@ -410,7 +410,7 @@ def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(
         description="Browse cached Humble Bundle games and bundles."
-                    " Read-only: run 'humblebundle --update' to refresh"
+                    " Read-only: run 'hb --update' to refresh"
                     " the cache.")
     parser.add_argument('-D', '--debug', dest='loglevel',
                         action="store_const", const=logging.DEBUG,

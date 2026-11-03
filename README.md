@@ -41,14 +41,15 @@ Clone the repository and install as an editable package:
 	git clone https://github.com/MestreLion/humblebundle.git
 	pip install -e humblebundle
 
-This installs both the main script `humblebundle` and the library `humblebundle`.
+This installs the command-line tool `hb`, the TUI `hb-tui` and the library `humblebundle`.
+The TUI needs Textual: install with `pip install -e "humblebundle[tui]"`.
 
 Uninstall
 ---------
 
 Remove the session cookie from the keyring and delete the cookies file:
 
-	humblebundle --clear
+	hb --clear
 
 Uninstall and delete the directory:
 
@@ -69,7 +70,7 @@ Usage as a command-line tool
 
 Adapted from `--help`:
 
-	Usage: humblebundle [general options] [command] [command options]
+	Usage: hb [general options] [command] [command options]
 
 	Optional arguments:
 	  -h|--help
@@ -174,7 +175,7 @@ Authenticating (only needed once, and again when the session expires):
    cookie is saved in the system keyring (service `humblebundle`, username
    `SESSION_COOKIE`):
 
-	$ humblebundle --auth --update
+	$ hb --auth --update
 	Paste the value of the _simpleauth_sess cookie (input is hidden):
 
 Later runs read the cookie from the keyring. If it expires, the tool reports
@@ -183,7 +184,7 @@ Later runs read the cookie from the keyring. If it expires, the tool reports
 
 Show bundle and game info:
 
-	$ humblebundle --show-bundle androidbundle5
+	$ hb --show-bundle androidbundle5
 
 	Bundle    : androidbundle5
 	Name      : Humble Bundle with Android 5
@@ -207,14 +208,14 @@ Show bundle and game info:
 		Superbrothers: Sword & Sworcery EP	[swordandsworcery_android_pc_soundtrack]
 
 
-	$ humblebundle --list solar
+	$ hb --list solar
 
 	solar_android_pc
 	solarflux
 	solarflux_android
 
 
-	$ humblebundle --show solar_android_pc
+	$ hb --show solar_android_pc
 
 	Game      : solar_android_pc
 	Name      : Solar 2
@@ -239,7 +240,7 @@ Show bundle and game info:
 
 Download a file:
 
-	$ humblebundle --download solar_android_pc --platform audio --type mp3
+	$ hb --download solar_android_pc --platform audio --type mp3
 
 	Downloading 'Solar 2' [solar_android_pc] 'MP3' 53.5 MB solar2_ost_mp3_1409159048.zip
 	  27% of 53.5 MiB |................                       |   1.23 M/s ETA:  00:00:3
@@ -247,7 +248,7 @@ Download a file:
 
 Install a game (may require an entry in `gamedata.json` or manual options):
 
-	$ humblebundle --install dontmove
+	$ hb --install dontmove
 
 	Downloading "Don't Move" [dontmove]  (64-bit)  4.7 MB  DontMove_v1-3_Linux-64.tar
 	Installing Don't Move
@@ -259,7 +260,7 @@ Usage as a library
 
     import humblebundle
 
-    # Uses the session cookie saved in the keyring by `humblebundle --auth`.
+    # Uses the session cookie saved in the keyring by `hb --auth`.
     # Or pass it directly: humblebundle.HumbleBundle(auth='<_simpleauth_sess value>')
     hb = humblebundle.HumbleBundle()
 
