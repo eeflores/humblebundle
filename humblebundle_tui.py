@@ -79,7 +79,7 @@ class HumbleBundleApp(App):
         min-width: 30;
     }
     #filter-status {
-        height: 1;
+        height: auto;
         padding: 0 1;
         color: $text-muted;
     }
@@ -107,6 +107,7 @@ class HumbleBundleApp(App):
         Binding("escape", "clear_filter", "Clear filter", show=False),
         Binding("p", "next_platform", "Platform"),
         Binding("P", "previous_platform", "Platform", show=False),
+        Binding("h", "toggle_empty", "No-download items"),
         Binding("e", "expand_all", "Expand"),
         Binding("c", "collapse_all", "Collapse"),
         Binding("l", "toggle_log", "Log"),
@@ -120,6 +121,11 @@ class HumbleBundleApp(App):
         self.platforms = [None]  # None means all platforms
         self.platform_index = 0
         self.filter_text = ""
+        # Show games with no downloadable files, and bundles with no games
+        # left to show. Toggled with h.
+        self.show_empty = False
+        # Machine name -> set of platforms with at least one file to download
+        self.download_platforms = {}
         self.thread_id = None
 
     # Layout ----------------------------------------------------------------
@@ -186,6 +192,10 @@ class HumbleBundleApp(App):
             {d.get('platform', '')
              for game in hb.games.values()
              for d in game.get('downloads', [])} - {''})
+        self.download_platforms = {
+            key: {platform for platform, files in hb.get_downloads(key)
+                  if files}
+            for key in hb.games}
         log.info("Loaded %d games from %d bundles",
                  len(hb.games), len(hb.bundles))
         self.rebuild_tree()
@@ -200,12 +210,20 @@ class HumbleBundleApp(App):
     def platform(self):
         return self.platforms[self.platform_index]
 
-    def _game_matches(self, key, text):
+    def _game_matches(self, key, text, show_empty):
         game = self.hb.games[key]
-        if self.platform and not any(
-                d.get('platform') == self.platform
-                for d in game.get('downloads', [])):
-            return False
+        if show_empty:
+            # Any download entry for the platform, even with no files
+            if self.platform and not any(
+                    d.get('platform') == self.platform
+                    for d in game.get('downloads', [])):
+                return False
+        else:
+            # At least one file to download, for the platform if one is set
+            platforms = self.download_platforms.get(key, set())
+            if not platforms or (self.platform and
+                                 self.platform not in platforms):
+                return False
         if not text:
             return True
         return (text in key.lower() or
@@ -224,6 +242,21 @@ class HumbleBundleApp(App):
         bundled = set()
         shown_bundles = 0
         seen_games = set()
+        # Games and bundles that only show_empty would add to the tree
+        hidden_games = set()
+        hidden_bundles = 0
+
+        def matching(keys, text):
+            '''Return the keys to show, and record the ones hidden only
+            for having no downloads'''
+            games = [k for k in keys
+                     if self._game_matches(k, text, self.show_empty)]
+            if not self.show_empty:
+                shown = set(games)
+                hidden_games.update(
+                    k for k in keys
+                    if k not in shown and self._game_matches(k, text, True))
+            return games
 
         bundles = sorted(self.hb.bundles.values(),
                          key=lambda b: (b.get('human_name', '').lower(),
@@ -237,12 +270,20 @@ class HumbleBundleApp(App):
             name_match = bool(text) and text in name.lower()
             if name_match:
                 text = ""
-            games = [k for k in keys if self._game_matches(k, text)]
-            # Some purchases list no games at all (such as key-only ones).
-            # Show those unless a filter excludes them.
-            if not games and (keys or self.platform or
-                              (self.filter_text and not name_match)):
-                continue
+            games = matching(keys, text)
+            if not games:
+                # Some purchases list no games at all (such as key-only
+                # ones). With show_empty, show those unless a filter
+                # excludes them.
+                excluded = bool(keys or self.platform or
+                                (self.filter_text and not name_match))
+                if not self.show_empty:
+                    if not excluded or any(
+                            self._game_matches(k, text, True) for k in keys):
+                        hidden_bundles += 1
+                    continue
+                if excluded:
+                    continue
             node = tree.root.add(
                 "%s [dim](%d)[/dim]" % (escape(name), len(games)),
                 data=("bundle", bundle['machine_name']),
@@ -253,8 +294,8 @@ class HumbleBundleApp(App):
             shown_bundles += 1
             seen_games.update(games)
 
-        others = [k for k in self.hb.games
-                  if k not in bundled and self._game_matches(k, self.filter_text)]
+        others = matching([k for k in self.hb.games if k not in bundled],
+                          self.filter_text)
         if others:
             node = tree.root.add("[i]%s[/i] [dim](%d)[/dim]" %
                                  (NO_BUNDLE, len(others)),
@@ -264,9 +305,16 @@ class HumbleBundleApp(App):
                               data=("game", key))
             seen_games.update(others)
 
-        self.query_one("#filter-status", Static).update(
-            "Platform: [b]%s[/b]   %d games in %d bundles" %
-            (escape(self.platform or "all"), len(seen_games), shown_bundles))
+        status = ("Platform: [b]%s[/b]   %d games in %d bundles" %
+                  (escape(self.platform or "all"), len(seen_games),
+                   shown_bundles))
+        if self.show_empty:
+            status += "\n[dim]Showing items without downloads (h)[/dim]"
+        elif hidden_games or hidden_bundles:
+            status += ("\n[dim]Hidden: %d games, %d bundles without"
+                       " downloads (h)[/dim]" %
+                       (len(hidden_games), hidden_bundles))
+        self.query_one("#filter-status", Static).update(status)
 
     def on_input_changed(self, event: Input.Changed):
         self.filter_text = event.value.strip().lower()
@@ -386,6 +434,10 @@ class HumbleBundleApp(App):
     def action_previous_platform(self):
         self._cycle_platform(-1)
 
+    def action_toggle_empty(self):
+        self.show_empty = not self.show_empty
+        self.rebuild_tree()
+
     def action_expand_all(self):
         for node in self.query_one("#tree", Tree).root.children:
             node.expand()
@@ -399,7 +451,8 @@ class HumbleBundleApp(App):
 
     def check_action(self, action, parameters):
         # Let printable keys reach the filter box while typing in it
-        if (action in ("next_platform", "previous_platform", "expand_all",
+        if (action in ("next_platform", "previous_platform", "toggle_empty",
+                       "expand_all",
                        "collapse_all", "toggle_log", "quit", "focus_filter")
                 and isinstance(self.focused, Input)):
             return False
